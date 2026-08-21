@@ -4,8 +4,8 @@ Custom Detection Head - Built From Scratch (Anchor-Free)
 Takes the Neck's fused multi-scale feature maps and produces the
 final predictions at every spatial location (grid cell) of each scale:
 
-  1. Bounding box regression: (tx, ty, tw, th) - offsets to compute
-     the actual box position/size at that grid cell
+  1. Bounding box regression: (xc, yc, w, h) - normalized box
+     position/size at that grid cell
   2. Objectness score: how confident the model is that THIS grid
      cell contains a drone (vs background)
   3. Class probability: what class the object is (for us: just
@@ -43,12 +43,19 @@ class DetectionHeadSingleScale(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
-        # --- Regression branch: predicts (tx, ty, tw, th) per cell ---
+        # --- Regression branch: predicts (xc, yc, w, h) per cell ---
         self.reg_branch = nn.Sequential(
             ConvBlock(in_channels, in_channels, kernel_size=3, activation=activation),
             ConvBlock(in_channels, in_channels, kernel_size=3, activation=activation),
         )
-        self.reg_output = nn.Conv2d(in_channels, 4, kernel_size=1)  # tx, ty, tw, th
+        self.reg_output = nn.Conv2d(in_channels, 4, kernel_size=1)  # xc, yc, w, h (pre-sigmoid)
+        # IMPORTANT: raw conv output is unbounded (can be negative or huge).
+        # Since our targets are normalized to [0,1] relative to the image,
+        # we squash predictions into that same range with sigmoid. Without
+        # this, box width/height can go negative, which corrupts CIoU loss
+        # and destabilizes the whole model (this was found via debugging -
+        # a model trained without this produced height values like -32).
+        self.reg_activation = nn.Sigmoid()
 
         # --- Classification branch: predicts objectness + class scores ---
         self.cls_branch = nn.Sequential(
@@ -61,7 +68,8 @@ class DetectionHeadSingleScale(nn.Module):
     def forward(self, x: torch.Tensor) -> dict:
         # Regression branch
         reg_feat = self.reg_branch(x)
-        bbox_pred = self.reg_output(reg_feat)  # (B, 4, H, W)
+        bbox_pred = self.reg_output(reg_feat)  # (B, 4, H, W), raw
+        bbox_pred = self.reg_activation(bbox_pred)  # squash to [0, 1]
 
         # Classification branch
         cls_feat = self.cls_branch(x)
