@@ -32,6 +32,7 @@ from tqdm import tqdm
 from models.model import build_model
 from data.dataset import build_dataloader
 from training.loss import DetectionLoss
+from evaluation.metrics import compute_map
 
 
 def assign_box_to_scale(box_w: float, box_h: float, num_scales: int) -> int:
@@ -187,7 +188,78 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, device, epoch_num: in
     }
 
 
-def main(num_epochs: int = 5, data_yaml_path: str = "data/raw_video_dataset/data.yaml"):
+def decode_predictions_for_eval(predictions: list, conf_threshold: float = 0.3):
+    """
+    Converts raw model predictions (per-scale grid outputs) into a flat
+    list of (boxes, scores) for ONE image - the format the evaluation
+    metrics module expects. Only keeps cells above conf_threshold.
+    """
+    all_boxes = []
+    all_scores = []
+    for pred in predictions:
+        obj = torch.sigmoid(pred["objectness"][0, 0])  # (H, W)
+        bbox = pred["bbox"][0]  # (4, H, W)
+
+        H, W = obj.shape
+        positive_cells = (obj > conf_threshold).nonzero(as_tuple=False)
+
+        for cell in positive_cells:
+            y, x = cell.tolist()
+            box = bbox[:, y, x].tolist()  # [xc, yc, w, h] normalized
+            score = obj[y, x].item()
+            all_boxes.append(box)
+            all_scores.append(score)
+
+    if len(all_boxes) == 0:
+        return torch.zeros((0, 4)), torch.zeros(0)
+
+    return torch.tensor(all_boxes), torch.tensor(all_scores)
+
+
+def evaluate(model, dataloader, device, conf_threshold: float = 0.3):
+    """
+    Runs the model on an entire validation/test dataloader and computes
+    mAP50, mAP50-95, precision, and recall. Uses batch_size=1 internally
+    per image so predictions can be decoded and matched individually
+    (the dataloader can still be built with any batch_size - we just
+    iterate through it image by image here for simplicity).
+    """
+    model.eval()
+
+    all_pred_boxes = []
+    all_pred_scores = []
+    all_gt_boxes = []
+
+    with torch.no_grad():
+        for images, boxes_list, labels_list in dataloader:
+            images = images.to(device)
+            predictions = model(images)
+
+            batch_size = images.shape[0]
+            for b in range(batch_size):
+                # Extract this single image's predictions from the batched output
+                single_preds = [
+                    {
+                        "objectness": pred["objectness"][b:b+1],
+                        "bbox": pred["bbox"][b:b+1],
+                        "class": pred["class"][b:b+1],
+                    }
+                    for pred in predictions
+                ]
+                pred_boxes, pred_scores = decode_predictions_for_eval(single_preds, conf_threshold)
+
+                all_pred_boxes.append(pred_boxes)
+                all_pred_scores.append(pred_scores)
+                all_gt_boxes.append(boxes_list[b].cpu())
+
+    results = compute_map(all_pred_boxes, all_pred_scores, all_gt_boxes)
+    model.train()
+    return results
+
+
+
+def main(num_epochs: int = 5, data_yaml_path: str = "data/raw_video_dataset/data.yaml",
+         eval_every: int = 10, conf_threshold: float = 0.3):
     with open("configs/base_config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
@@ -201,7 +273,9 @@ def main(num_epochs: int = 5, data_yaml_path: str = "data/raw_video_dataset/data
 
     print("\nLoading dataset...")
     train_loader, train_dataset = build_dataloader(data_yaml_path, "train", config)
+    val_loader, val_dataset = build_dataloader(data_yaml_path, "val", config, shuffle=False)
     print(f"  Training images: {len(train_dataset)}")
+    print(f"  Validation images: {len(val_dataset)}")
 
     loss_fn = DetectionLoss(config)
 
@@ -209,8 +283,10 @@ def main(num_epochs: int = 5, data_yaml_path: str = "data/raw_video_dataset/data
     weight_decay = config["training"]["weight_decay"]
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    print(f"\nStarting training for {num_epochs} epochs...\n")
+    print(f"\nStarting training for {num_epochs} epochs (validating every {eval_every} epochs)...\n")
     os.makedirs("checkpoints", exist_ok=True)
+
+    best_map50 = 0.0
 
     for epoch in range(1, num_epochs + 1):
         metrics = train_one_epoch(model, train_loader, loss_fn, optimizer, device, epoch)
@@ -221,10 +297,26 @@ def main(num_epochs: int = 5, data_yaml_path: str = "data/raw_video_dataset/data
             f"box_loss: {metrics['avg_box_loss']:.4f}"
         )
 
-        checkpoint_path = f"checkpoints/epoch_{epoch}.pt"
-        torch.save(model.state_dict(), checkpoint_path)
+        # Periodic validation (and always on the very last epoch)
+        if epoch % eval_every == 0 or epoch == num_epochs:
+            val_results = evaluate(model, val_loader, device, conf_threshold)
+            print(
+                f"  >> Validation - mAP50: {val_results['mAP50']:.4f}, "
+                f"mAP50-95: {val_results['mAP50_95']:.4f}, "
+                f"precision: {val_results['precision']:.4f}, "
+                f"recall: {val_results['recall']:.4f}"
+            )
 
-    print("\nTraining complete. Checkpoints saved in checkpoints/")
+            if val_results["mAP50"] > best_map50:
+                best_map50 = val_results["mAP50"]
+                torch.save(model.state_dict(), "checkpoints/best_model.pt")
+                print(f"  >> New best model saved (mAP50: {best_map50:.4f})")
+
+    # Always save the final epoch's weights too, regardless of whether it was "best"
+    torch.save(model.state_dict(), "checkpoints/last_model.pt")
+
+    print(f"\nTraining complete. Best mAP50: {best_map50:.4f}")
+    print("Checkpoints saved: checkpoints/best_model.pt, checkpoints/last_model.pt")
 
 
 if __name__ == "__main__":
@@ -233,6 +325,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train AttentiveDroneNet")
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs (default: 5, for quick sanity test)")
     parser.add_argument("--data", type=str, default="data/raw_video_dataset/data.yaml", help="Path to data.yaml")
+    parser.add_argument("--eval_every", type=int, default=10, help="Run validation every N epochs (default: 10)")
     args = parser.parse_args()
 
-    main(num_epochs=args.epochs, data_yaml_path=args.data)
+    main(num_epochs=args.epochs, data_yaml_path=args.data, eval_every=args.eval_every)
